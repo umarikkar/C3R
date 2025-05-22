@@ -8,3 +8,4 @@ wandb==0.19.6
 pycytominer
 seaborn
 opencv-contrib-python
+importlib_metadata

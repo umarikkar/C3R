@@ -425,7 +425,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
     params_k = [param_k for name_k, param_k in zip(names_k, params_k) if name_k in names_common]
 
     pred_labels, real_labels = [], []
-    for it, (images, labels, masks) in enumerate(metric_logger.log_every(data_loader, 5, header)):
+    for it, (images, labels, masks) in enumerate(metric_logger.log_every(data_loader, 100, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
