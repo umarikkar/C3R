@@ -5,3 +5,6 @@ torchvision==0.21.0
 timm==1.0.14
 einops==0.8.0
 wandb==0.19.6
+pycytominer
+seaborn
+opencv-contrib-python

@@ -56,7 +56,7 @@ def get_args_parser():
     parser.add_argument('--batch_size_per_gpu', default=6, type=int,
         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
     parser.add_argument('--epochs', default=400, type=int, help='Number of epochs of training.')
-    parser.add_argument('--data_prop', default=0.02, type=float, help="Dataset proportion to train on")
+    parser.add_argument('--data_prop', default=1.0, type=float, help="Dataset proportion to train on")
 
     
     # Model parameters
@@ -131,12 +131,12 @@ def get_args_parser():
         to use half precision for training. Improves training time and memory requirements,
         but can provoke instability and slight decay of performance. We recommend disabling
         mixed precision if the loss is unstable, if reducing the patch size or if training with bigger ViTs.""")
-    parser.add_argument('--weight_decay', type=float, default=0.04, help="""Initial value of the
+    parser.add_argument('--weight_decay', type=float, default=0.1, help="""Initial value of the
         weight decay. With ViT, a smaller value at the beginning of training works well.""")
-    parser.add_argument('--weight_decay_end', type=float, default=0.4, help="""Final value of the
+    parser.add_argument('--weight_decay_end', type=float, default=0.5, help="""Final value of the
         weight decay. We use a cosine schedule for WD and using a larger decay by
         the end of training improves performance for ViTs.""")
-    parser.add_argument('--clip_grad', type=float, default=0.3, help="""Maximal parameter
+    parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
         gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
         help optimization for larger ViT architectures. 0 for disabling.""")
 
@@ -645,7 +645,7 @@ if __name__ == '__main__':
     if args.output_dir == '':
         args.output_dir = f"{args.arch}_{method_dict[args.channels]}"
 
-    args.output_dir = os.path.join(os.getcwd(), 'results', args.output_dir)
+    args.output_dir = os.path.join(os.getcwd(), 'results/pretrain', args.output_dir)
 
     print("output directory:", args.output_dir)
 

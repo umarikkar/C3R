@@ -657,7 +657,7 @@ if __name__ == '__main__':
     if args.output_dir == '':
         args.output_dir = f"{args.arch}_ChannelViT"
 
-    args.output_dir = os.path.join(os.getcwd(), 'results', args.output_dir)
+    args.output_dir = os.path.join(os.getcwd(), 'results/pretrain', args.output_dir)
 
     print("output directory:", args.output_dir)
 

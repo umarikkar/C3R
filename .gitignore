@@ -176,3 +176,5 @@ cython_debug/
 *.pth
 *.pt
 *.h5
+results/
+data/HPA_metadata.csv
