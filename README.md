@@ -50,9 +50,10 @@ torchrun --nproc-per-node=8 train_scripts/train_c3r.py --arch 'vit_small' --batc
 ---
 ## Pre-trained checkpoints
 
-The pre-trained checkpoints can be found at https://doi.org/10.5281/zenodo.15490165
+The pre-trained checkpoints, and pre-computed features can be found at https://doi.org/10.5281/zenodo.15490165
 
 ---
 ## Evaluation
 
-We follow the same evaluation protocol as SubCell and use their code. Our exact implementation will be uploaded shortly. 
+Use eval_scripts/train_hpa_19.py and train_hpa_31.py for 19 and 31-class protein localization with the argument --features_folder as your pre-computed features. 
+For JUMP-CP, we use the exact subcell script to run OOD evaluation. 

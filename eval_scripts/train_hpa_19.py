@@ -204,7 +204,7 @@ if __name__ == "__main__":
 
     args = argparser.parse_args()
 
-    features_folder = f"HPA_test_19classes/{args.features_folder.replace('.pth', '').split('/')[-1]}/Classifier"
+    features_folder = f"results/HPA_test_19classes/{args.features_folder.replace('.pth', '').split('/')[-1]}/Classifier"
 
     os.makedirs(features_folder, exist_ok=True)
 
