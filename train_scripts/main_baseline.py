@@ -7,68 +7,48 @@
 import argparse
 import os
 import sys
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.abspath(os.path.join(script_dir, os.pardir))
+os.chdir(parent_dir)
+sys.path.insert(0, parent_dir)
+
 import datetime
 import time
 import math
 import json
 import numpy as np
 import utils
-import models
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
-from data.augmentations import DataAugmentationiBOT_HPA
-import multiprocessing
 
 from pathlib import Path
-from PIL import Image
-from torchvision import datasets, transforms
-from torchvision import models as torchvision_models
 import wandb
 
+import models.vision_transformer as vits
 from models.head import iBOTHead
-from data.hpa_dataset import ImageFolderMask
-
-from data.augmentations import DataAugmentationiBOT, DataAugmentationiBOT_HPA
 from models.ntxent import ContrastiveLoss
 
+from data.hpa_dataset import ImageFolderMask
+from data.augmentations import DataAugmentationiBOT_HPA
 
-import timm
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('iBOT', add_help=False)
-
-    parser.add_argument('--method_arch', default='cce_preagg', type=str,
-                        choices = ['vit', 'cce_preagg', 'cce_postagg', 'singlevit', 'dichavit', 'channelvit'],  help="""Method""")
+    parser = argparse.ArgumentParser('C3R', add_help=False)
 
     # SubCell and IHC arguments =====================================================================================================            
 
     parser.add_argument('--n_cells', default=8, type=int,
         help='number of cells')
     parser.add_argument('--prot_weight', type=float, default=1., help="""Pred weight for protein loss""")
-    parser.add_argument('--channels', default='all', type=str,
+    parser.add_argument('--channels', default='random', type=str,
         help="""Dataset channel sampling. choose from 'random' to sample a single channel, 
                 'mt' to sample the ER, Nuc and Prot channels,
                 'all' to sample all channels. """)
-    
-    # CCE architecture arguments ====================================================================================================
 
-    parser.add_argument('--pre_layers', default=[0,1], type=int, nargs='+',
-        help='number of branched encoder layers')
-    parser.add_argument('--post_layer_count', default=-1, type=int,
-        help=""" depth after merging. -1 for auto-calculate to match baseline parameter count. """)
-    
-    # MCD training arguments ========================================================================================================
-
-    parser.add_argument('--student_keep_count', default=[1,2,3], type=int, nargs='+',
-        help="""MCD channel sampling rate is chosen from this distribution.
-            [3] to sample all context channels always
-            [2] to sample two always ... """)
-    parser.add_argument('--teacher_keep_count', default=[3], type=int, nargs='+',
-        help="""MCD channel sampling rate is chosen from this distribution.""")
-    
     # Remaining iBOT arguments ======================================================================================================
 
     parser.add_argument('--wandb', default=0, type=int,
@@ -85,8 +65,8 @@ def get_args_parser():
                  'swin_tiny','swin_small', 'swin_base', 'swin_large'],
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
-    parser.add_argument('--in_chans', default=4, type=int,
-        help='number of cells')
+    parser.add_argument('--in_chans', default=1, type=int,
+        help='number of channels')
     
     parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
         of input square patches - default 16 (for 16x16 patches). Using smaller
@@ -189,9 +169,9 @@ def get_args_parser():
     parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.15, 0.32),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""")
-
+    
     # Misc
-    parser.add_argument('--data_path', default='/scratch1/test_data/antibody_cell_imgs', type=str,
+    parser.add_argument('--data_path', default='./sample_data', type=str,
         help='Please specify path to the ImageNet training data.')
     parser.add_argument('--output_dir', default='', type=str, help='Path to save logs and checkpoints.')    
     parser.add_argument('--saveckp_freq', default=10, type=int, help='Save checkpoint every x epochs.')
@@ -211,19 +191,6 @@ def train_ibot(args):
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
 
-    if args.method_arch == 'vit' or args.method_arch == 'singlevit':
-        vits = models.vision_transformer
-    elif args.method_arch == 'cce_preagg':
-        vits = models.vision_transformer_cce_preagg
-        in_groups = [args.context_channels, args.concept_channels]
-    elif args.method_arch == 'cce_postagg':
-        vits =models.vision_transformer_cce_postagg
-        in_groups = [args.context_channels, args.concept_channels]
-    elif args.method_arch == 'dichavit':
-        vits = models.vision_transformer_dichavit
-    elif args.method_arch == 'channelvit':
-        vits = models.vision_transformer_channelvit
-
     # ============ preparing data ... ============
     transform = DataAugmentationiBOT_HPA(
         args.global_crops_scale,
@@ -233,8 +200,6 @@ def train_ibot(args):
         global_crops_size=224,
         local_crops_size=96
     ) 
-
-    pred_size = args.patch_size * 8 if 'swin' in args.arch else args.patch_size
     
     dataset = ImageFolderMask(
         args.data_path, 
@@ -244,16 +209,13 @@ def train_ibot(args):
         data_prop=args.data_prop,
         channels=args.channels,
 
-        patch_size=pred_size,
+        patch_size=args.patch_size,
         pred_ratio=args.pred_ratio,
         pred_ratio_var=args.pred_ratio_var,
         pred_aspect_ratio=(0.3, 1/0.3),
         pred_shape=args.pred_shape,
         pred_start_epoch=args.pred_start_epoch)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
-
-
-    # pin_memory=True if args.prefetch_factor > 0 else False
 
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -263,14 +225,10 @@ def train_ibot(args):
         pin_memory=True,
         drop_last=True,
         persistent_workers=False,
-        # prefetch_factor=args.prefetch_factor
-        # collate_fn=
     )
-    print(f"Data loaded: there are {len(dataset)} images.")
+    print(f"Data loaded: there are {len(dataset)} samples. This is {len(dataset) * args.n_cells} images passed per epoch.")
 
     # ============ building student and teacher networks ... ============
-    # we changed the name DeiT-S for ViT-S to avoid confusions
-    args.arch = args.arch.replace("deit", "vit")
 
     student = vits.__dict__[args.arch](
         patch_size=args.patch_size,
@@ -278,28 +236,13 @@ def train_ibot(args):
         return_all_tokens=True,
         masked_im_modeling=args.use_masked_im_modeling,
         in_chans=args.in_chans,
-        patch_embed_layer=args.embed_layer,
-        in_groups=[[0,1,2], [3]],
-        pre_layers=args.pre_layers,
-        post_layer_count=args.post_layer_count,
-        keep_channels=args.student_keep_count,
     )
     teacher = vits.__dict__[args.arch](
         patch_size=args.patch_size,
         return_all_tokens=True,
         in_chans=args.in_chans,
-        patch_embed_layer=args.embed_layer,
-        in_groups=[[0,1,2], [3]],
-        pre_layers=args.pre_layers,
-        post_layer_count=args.post_layer_count,
-        keep_channels=args.teacher_keep_count,
     )
     embed_dim = student.embed_dim
-
-    print(student)
-
-    # for n,p in student.named_parameters():
-    #     print(n, p.shape)
 
     # multi-crop wrapper handles forward with inputs of different resolutions
     student = utils.MultiCropWrapper(student, iBOTHead(
@@ -320,6 +263,8 @@ def train_ibot(args):
             shared_head=args.shared_head_teacher,
 
         ))
+    
+    print(student)
 
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
@@ -329,14 +274,12 @@ def train_ibot(args):
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
         # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu], broadcast_buffers=False) if \
-            'swin' in args.arch else nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
         teacher_without_ddp = teacher.module
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], broadcast_buffers=False) if \
-        'swin' in args.arch else nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict(), strict=False)
     # there is no backpropagation through the teacher, so no need for gradients
@@ -364,16 +307,9 @@ def train_ibot(args):
         n_cells=args.n_cells,
     ).cuda()
 
-    # predz = f"pred_{args.pred_shape}_{args.pred_ratio}_{args.pred_ratio_var}" if args.use_masked_im_modeling else "noMIM"
-    # args.output_dir = f"{args.output_dir.split('/')[-1]}_{predz}"  
-
-
     if utils.is_main_process() and args.wandb: # wandb configuration
-        # pr = 'ibot_local_test' if args.data_prop < 1 else 'ibot_local'
         pr = 'CellPretraining'
-
         nm = args.output_dir.split('/')[-1]
-            
         wandb.init(
         project=pr,  # Set your project name
         name=nm if nm else None,  # Optional run name
@@ -489,7 +425,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
     params_k = [param_k for name_k, param_k in zip(names_k, params_k) if name_k in names_common]
 
     pred_labels, real_labels = [], []
-    for it, (images, labels, masks) in enumerate(metric_logger.log_every(data_loader, 100, header)):
+    for it, (images, labels, masks) in enumerate(metric_logger.log_every(data_loader, 5, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -697,28 +633,21 @@ class iBOTLoss(nn.Module):
 
 if __name__ == '__main__':
 
-
-    # os.environ['CUDA_VISIBLE_DEVICES']="1"
-
-    parser = argparse.ArgumentParser('iBOT', parents=[get_args_parser()])
+    parser = argparse.ArgumentParser('C3R', parents=[get_args_parser()])
     args = parser.parse_args()
 
-    if 'base' in args.arch:
-        vv = 'vit_b'
-    elif 'small' in args.arch:
-        vv = 'vit_s'
-    else:
-        vv = args.arch
+    method_dict = {
+        'random': 'SingleChan',
+        'all': 'Baseline',
+        'mt': 'Baseline_3ch'
+    }
 
     if args.output_dir == '':
-        args.output_dir = f"{vv}_{args.global_crops_number}_{args.local_crops_number}_{args.embed_layer}"
-    else:
-        args.output_dir = f"{vv}_{args.global_crops_number}_{args.local_crops_number}_{args.embed_layer}_{args.output_dir}"
+        args.output_dir = f"{args.arch}_{method_dict[args.channels]}"
 
-    predz = f"{args.pred_shape}_{args.pred_ratio}_{args.pred_ratio_var}" if args.use_masked_im_modeling else "noMIM"
-    args.output_dir = f"{args.output_dir.split('/')[-1]}_{predz}"  
+    args.output_dir = os.path.join(os.getcwd(), 'results', args.output_dir)
 
-    args.output_dir = os.path.join(os.getcwd(), 'results_ibot', args.output_dir)
+    print("output directory:", args.output_dir)
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     train_ibot(args)

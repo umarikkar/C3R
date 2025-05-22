@@ -31,7 +31,7 @@ import random
 import sys
 
 COLORS = ["red", "yellow", "blue", "green"]
-LOCATION_MAP = pd.read_csv("annotations/location_group_mapping.tsv", sep="\t")
+LOCATION_MAP = pd.read_csv("data/annotations/location_group_mapping.tsv", sep="\t")
 UNIQUE_CATS = LOCATION_MAP["Original annotation"].unique().tolist()
 UNIQUE_CATS.append("Negative")
 NUM_CLASSES = len(UNIQUE_CATS)
@@ -172,7 +172,7 @@ class HPASubCellDataset(VisionDataset):
         
         all_samples = pd.DataFrame({'filename':glob.glob(data_folder + '/*.h5'), 'antibody':''})
         all_samples['antibody'] = [f.split('/')[-1][:-5] for f in all_samples['filename']]
-        with open(f"./annotations/splits/{split}_antibodies.txt") as file:
+        with open(f"./data/annotations/splits/{split}_antibodies.txt") as file:
             antibodies = pd.DataFrame({'antibody':[line.rstrip() for line in file]})
 
         

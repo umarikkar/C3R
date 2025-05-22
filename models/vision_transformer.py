@@ -172,7 +172,7 @@ class PatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.num_patches = num_patches
 
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, groups=groups)
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
             
     def forward(self, x):
         B, C, H, W = x.shape
@@ -191,7 +191,7 @@ class VisionTransformer(nn.Module):
         self.return_all_tokens = return_all_tokens
         
         self.patch_embed = PatchEmbed(
-                    img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim, groups=in_chans)
+                    img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
 
         num_patches = self.patch_embed.num_patches
 

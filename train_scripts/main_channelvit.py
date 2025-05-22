@@ -7,79 +7,70 @@
 import argparse
 import os
 import sys
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.abspath(os.path.join(script_dir, os.pardir))
+os.chdir(parent_dir)
+sys.path.insert(0, parent_dir)
+
 import datetime
 import time
 import math
 import json
 import numpy as np
 import utils
-import models
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
-from data.augmentations import DataAugmentationiBOT_HPA
-import multiprocessing
-
-import models.vision_transformer as vits
 
 from pathlib import Path
-from PIL import Image
-from torchvision import datasets, transforms
-from torchvision import models as torchvision_models
 import wandb
 
+import models.vision_transformer_channelvit as vits
 from models.head import iBOTHead
-from data.hpa_dataset import ImageFolderMask
-
-from data.augmentations import DataAugmentationiBOT, DataAugmentationiBOT_HPA
 from models.ntxent import ContrastiveLoss
 
+from data.hpa_dataset_channelvit import ImageFolderMask
+from data.augmentations import DataAugmentationiBOT_HPA_CVIT
 
-import timm
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('iBOT', add_help=False)
+    parser = argparse.ArgumentParser('C3R', add_help=False)
 
-            
+    # SubCell and IHC arguments =====================================================================================================            
     parser.add_argument('--n_cells', default=8, type=int,
         help='number of cells')
-    
-    parser.add_argument('--in_chans', default=4, type=int,
-        help='number of cells')
-    
+    parser.add_argument('--prot_weight', type=float, default=1., help="""Pred weight for protein loss""")
     parser.add_argument('--channels', default='all', type=str,
-        help='number of cells')
+        help="""Dataset channel sampling. choose from 'random' to sample a single channel, 
+                'mt' to sample the ER, Nuc and Prot channels,
+                'all' to sample all channels. """)
     
-    parser.add_argument('--embed_layer', default='SES', type=str)
-
+    # ChannelViT arguments ========================================================================================================
+    parser.add_argument('--channel_budget', default=2, type=int, nargs='+',
+            help=""" 2 for ChannelViT and DiChaViT """)
+    
+    # Remaining iBOT arguments ======================================================================================================
 
     parser.add_argument('--wandb', default=0, type=int,
-        help='number of cells')
-    
-    parser.add_argument('--prefetch_factor', default=2, type=int,
-        help='number of cells')
-    
-    
-    parser.add_argument('--batch_size_per_gpu', default=6, type=int,
+        help='run wandb or not')
+    parser.add_argument('--batch_size_per_gpu', default=2, type=int,
         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
-
     parser.add_argument('--epochs', default=400, type=int, help='Number of epochs of training.')
     parser.add_argument('--data_prop', default=0.02, type=float, help="Dataset proportion to train on")
 
-    parser.add_argument('--prot_weight', type=float, default=1., help="""Pred weight for protein loss""")
-
+    
     # Model parameters
-    parser.add_argument('--arch', default='vit_base', type=str,
+    parser.add_argument('--arch', default='vit_small', type=str,
         choices=['vit_tiny', 'vit_small', 'vit_base', 'vit_large', 'deit_tiny', 'deit_small',
                  'swin_tiny','swin_small', 'swin_base', 'swin_large'],
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
+    parser.add_argument('--in_chans', default=4, type=int,
+        help='number of cells')
     
-    
-
-        
     parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
         of input square patches - default 16 (for 16x16 patches). Using smaller
         values leads to better performance but requires more memory. Applies only
@@ -109,22 +100,16 @@ def get_args_parser():
         help="Whether to use batch normalizations in projection head (Default: gelu)")
     parser.add_argument('--use_masked_im_modeling', default=True, type=utils.bool_flag,
         help="Whether to use masked image modeling (mim) in backbone (Default: True)")
+
     
-    # parser.add_argument('--pred_ratio', default=0.4, type=float, nargs='+', help="""Ratio of partial prediction.
-    #     If a list of ratio is specified, one of them will be randomly choosed for each patch.""")
-    # parser.add_argument('--pred_ratio_var', default=0.2, type=float, nargs='+', help="""Variance of partial prediction
-    #     ratio. Length should be indentical to the length of pred_ratio. 0 for disabling. """)
-    # parser.add_argument('--pred_start_epoch', default=0, type=int, help="""Start epoch to perform masked
-    #     image prediction. We typically set this to 50 for swin transformer. (Default: 0)""")
-    
-    parser.add_argument('--pred_ratio', default=[0.0, 0.4], type=float, nargs='+', help="""Ratio of partial prediction.
+    parser.add_argument('--pred_ratio', default=[0.0, 0.3], type=float, nargs='+', help="""Ratio of partial prediction.
         If a list of ratio is specified, one of them will be randomly choosed for each patch.""")
-    parser.add_argument('--pred_ratio_var', default=[0.0, 0.3], type=float, nargs='+', help="""Variance of partial prediction
+    parser.add_argument('--pred_ratio_var', default=[0.0, 0.2], type=float, nargs='+', help="""Variance of partial prediction
         ratio. Length should be indentical to the length of pred_ratio. 0 for disabling. """)
     parser.add_argument('--pred_start_epoch', default=10, type=int, help="""Start epoch to perform masked
         image prediction. We typically set this to 50 for swin transformer. (Default: 0)""")
-    
     parser.add_argument('--pred_shape', default='rand', type=str, help="""Shape of partial prediction.""")
+
     parser.add_argument('--lambda1', default=1.0, type=float, help="""loss weight for dino
         loss over [CLS] tokens (Default: 1.0)""")
     parser.add_argument('--lambda2', default=1.0, type=float, help="""loss weight for beit 
@@ -162,7 +147,7 @@ def get_args_parser():
         during which we keep the output layer fixed. Typically doing so during
         the first epoch helps training. Try increasing this value if the loss does not decrease.""")
     
-    parser.add_argument("--lr", default=0.00025, type=float, help="""Learning rate at the end of
+    parser.add_argument("--lr", default=0.0005, type=float, help="""Learning rate at the end of
         linear warmup (highest LR used during training). The learning rate is linearly scaled
         with the batch size, and specified here for a reference batch size of 256.""")
     parser.add_argument("--warmup_epochs", default=10, type=int,
@@ -187,14 +172,14 @@ def get_args_parser():
     parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.15, 0.32),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""")
-
+    
     # Misc
-    parser.add_argument('--data_path', default='/work/um00109/SubCell/subcell-embed-main/antibody_cell_imgs_uint8', type=str,
+    parser.add_argument('--data_path', default='./sample_data', type=str,
         help='Please specify path to the ImageNet training data.')
-    parser.add_argument('--output_dir', default="vit_b_local", type=str, help='Path to save logs and checkpoints.')    
+    parser.add_argument('--output_dir', default='', type=str, help='Path to save logs and checkpoints.')    
     parser.add_argument('--saveckp_freq', default=10, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
-    parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
+    parser.add_argument('--num_workers', default=0, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
@@ -210,16 +195,16 @@ def train_ibot(args):
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
-    transform = DataAugmentationiBOT_HPA(
+    transform = DataAugmentationiBOT_HPA_CVIT(
         args.global_crops_scale,
         args.local_crops_scale,
         args.global_crops_number,
         args.local_crops_number,
         global_crops_size=224,
-        local_crops_size=96
+        local_crops_size=96,
+        channel_budget=args.channel_budget,
+        total_channels=args.in_chans
     ) 
-
-    pred_size = args.patch_size * 8 if 'swin' in args.arch else args.patch_size
     
     dataset = ImageFolderMask(
         args.data_path, 
@@ -229,7 +214,7 @@ def train_ibot(args):
         data_prop=args.data_prop,
         channels=args.channels,
 
-        patch_size=pred_size,
+        patch_size=args.patch_size,
         pred_ratio=args.pred_ratio,
         pred_ratio_var=args.pred_ratio_var,
         pred_aspect_ratio=(0.3, 1/0.3),
@@ -237,24 +222,18 @@ def train_ibot(args):
         pred_start_epoch=args.pred_start_epoch)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
 
-    pin_memory=True if args.prefetch_factor > 0 else False
-
     data_loader = torch.utils.data.DataLoader(
         dataset,
         sampler=sampler,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
-        pin_memory=pin_memory,
+        pin_memory=True,
         drop_last=True,
         persistent_workers=False,
-        prefetch_factor=args.prefetch_factor
-        # collate_fn=
     )
-    print(f"Data loaded: there are {len(dataset)} images.")
+    print(f"Data loaded: there are {len(dataset)} samples. This is {len(dataset) * args.n_cells} images passed per epoch.")
 
     # ============ building student and teacher networks ... ============
-    # we changed the name DeiT-S for ViT-S to avoid confusions
-    args.arch = args.arch.replace("deit", "vit")
 
     student = vits.__dict__[args.arch](
         patch_size=args.patch_size,
@@ -262,20 +241,16 @@ def train_ibot(args):
         return_all_tokens=True,
         masked_im_modeling=args.use_masked_im_modeling,
         in_chans=args.in_chans,
-        patch_embed_layer=args.embed_layer,
-        in_groups=[[0,1,2], [3]],
     )
     teacher = vits.__dict__[args.arch](
         patch_size=args.patch_size,
         return_all_tokens=True,
         in_chans=args.in_chans,
-        patch_embed_layer=args.embed_layer,
-        in_groups=[[0,1,2], [3]],
     )
     embed_dim = student.embed_dim
 
     # multi-crop wrapper handles forward with inputs of different resolutions
-    student = utils.MultiCropWrapper(student, iBOTHead(
+    student = utils.MultiCropWrapper_CVIT(student, iBOTHead(
         embed_dim,
         args.out_dim,
         patch_out_dim=args.patch_out_dim,
@@ -284,7 +259,7 @@ def train_ibot(args):
         norm_last_layer=args.norm_last_layer,
         shared_head=args.shared_head,
         ))
-    teacher = utils.MultiCropWrapper(teacher, iBOTHead(
+    teacher = utils.MultiCropWrapper_CVIT(teacher, iBOTHead(
             embed_dim, 
             args.out_dim,
             patch_out_dim=args.patch_out_dim,
@@ -293,6 +268,8 @@ def train_ibot(args):
             shared_head=args.shared_head_teacher,
 
         ))
+    
+    print(student)
 
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
@@ -302,14 +279,12 @@ def train_ibot(args):
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
         # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu], broadcast_buffers=False) if \
-            'swin' in args.arch else nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
         teacher_without_ddp = teacher.module
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], broadcast_buffers=False) if \
-        'swin' in args.arch else nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict(), strict=False)
     # there is no backpropagation through the teacher, so no need for gradients
@@ -337,15 +312,9 @@ def train_ibot(args):
         n_cells=args.n_cells,
     ).cuda()
 
-    # predz = f"pred_{args.pred_shape}_{args.pred_ratio}_{args.pred_ratio_var}" if args.use_masked_im_modeling else "noMIM"
-    # args.output_dir = f"{args.output_dir.split('/')[-1]}_{predz}"  
-
-
     if utils.is_main_process() and args.wandb: # wandb configuration
-        pr = 'ibot_local_test' if args.data_prop < 1 else 'ibot_local'
-
+        pr = 'CellPretraining'
         nm = args.output_dir.split('/')[-1]
-            
         wandb.init(
         project=pr,  # Set your project name
         name=nm if nm else None,  # Optional run name
@@ -357,7 +326,6 @@ def train_ibot(args):
         )
 
 
-        
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
     if args.optimizer == "adamw":
@@ -462,7 +430,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
     params_k = [param_k for name_k, param_k in zip(names_k, params_k) if name_k in names_common]
 
     pred_labels, real_labels = [], []
-    for it, (images, labels, masks) in enumerate(metric_logger.log_every(data_loader, 100, header)):
+    for it, (images, labels, chans, masks) in enumerate(metric_logger.log_every(data_loader, 100, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -472,29 +440,34 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
 
         """
         this code snippet is to fix the HPA multi-cell image inputs for ibot. 
-        The even indexed image is always global_transfo1 and odd indexed image is always global_transfo2.
         """
 
         total_crops = args.local_crops_number + args.global_crops_number
 
         images_arranged = []
         masks_arranged = []
+        chans_arranged = []
+
         for crop_idx in range(total_crops):
             images_arranged.append(torch.cat(images[crop_idx::total_crops], dim=0))
             masks_arranged.append(torch.cat(masks[crop_idx::total_crops], dim=0))
+            chans_arranged.append(torch.cat(chans[crop_idx::total_crops], dim=0))
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images_arranged]
         masks = [msk.cuda(non_blocking=True) for msk in masks_arranged]        
+        chans = [chn.cuda(non_blocking=True) for chn in chans_arranged]    
         
         with torch.amp.autocast(device_type="cuda"):
             # get global views
-            teacher_output = teacher(images[:args.global_crops_number])
-            student_output = student(images[:args.global_crops_number], mask=masks[:args.global_crops_number])
+            teacher_output = teacher(images[:args.global_crops_number], chans=chans[:args.global_crops_number])
+            student_output = student(images[:args.global_crops_number], mask=masks[:args.global_crops_number],
+                                     chans=chans[:args.global_crops_number])
             
             # get local views
             student.module.backbone.masked_im_modeling = False
-            student_local_cls = student(images[args.global_crops_number:])[0] if len(images) > args.global_crops_number else None
+            student_local_cls = student(images[args.global_crops_number:],\
+                                        chans=chans[args.global_crops_number:])[0] if len(images) > args.global_crops_number else None
             student.module.backbone.masked_im_modeling = args.use_masked_im_modeling
 
             all_loss = ibot_loss(student_output, teacher_output, student_local_cls, masks, epoch, labels)
@@ -634,6 +607,13 @@ class iBOTLoss(nn.Module):
             for v in range(len(student_cls_c)):
                 if v == q:
                     loss2 = torch.sum(-teacher_patch_c[q] * F.log_softmax(student_patch_c[v], dim=-1), dim=-1)
+
+                    """
+                    here, we get the mean losses for student and teacher patch for both tokens. 
+                    """
+                    tkn = loss2.shape[-1]
+                    loss2 = 0.5 * (loss2[:, :tkn//2] + loss2[:, tkn//2:])
+
                     mask = student_mask[v].flatten(-2, -1)
                     loss2 = torch.sum(loss2 * mask.float(), dim=-1) / mask.sum(dim=-1).clamp(min=1.0)
                     total_loss2 += loss2.mean()
@@ -671,28 +651,15 @@ class iBOTLoss(nn.Module):
 
 if __name__ == '__main__':
 
-
-    # os.environ['CUDA_VISIBLE_DEVICES']="1"
-
-    parser = argparse.ArgumentParser('iBOT', parents=[get_args_parser()])
+    parser = argparse.ArgumentParser('C3R', parents=[get_args_parser()])
     args = parser.parse_args()
 
-    if 'base' in args.arch:
-        vv = 'vit_b'
-    elif 'small' in args.arch:
-        vv = 'vit_s'
-    else:
-        vv = args.arch
-
     if args.output_dir == '':
-        args.output_dir = f"{vv}_{args.global_crops_number}_{args.local_crops_number}_{args.embed_layer}"
-    else:
-        args.output_dir = f"{args.output_dir}_{args.embed_layer}"
+        args.output_dir = f"{args.arch}_ChannelViT"
 
-    predz = f"{args.pred_shape}_{args.pred_ratio}_{args.pred_ratio_var}" if args.use_masked_im_modeling else "noMIM"
-    args.output_dir = f"{args.output_dir.split('/')[-1]}_{predz}"  
+    args.output_dir = os.path.join(os.getcwd(), 'results', args.output_dir)
 
-    args.output_dir = os.path.join(os.getcwd(), 'results_ibot', args.output_dir)
+    print("output directory:", args.output_dir)
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     train_ibot(args)

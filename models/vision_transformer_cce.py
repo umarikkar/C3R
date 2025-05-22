@@ -175,14 +175,19 @@ class GroupedPatchEmbedSimple(nn.Module):
     """ Image to Patch Embedding with Grouped Projections.
         Only simple grouped projection and then concatenate. No FFN.
     """
-    def __init__(self, img_size=224, patch_size=16, in_chans=4, embed_dim=768, in_groups=[[0,1,2,3]], reduce_group=True, drop_channels=False):
+    def __init__(self, img_size=224, patch_size=16, embed_dim=768, in_groups=[[0,1,2,3]], reduce_group=True, keep_channels=[3],
+                 aggregation="post", debug=False):
         super().__init__()
 
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = (img_size // patch_size) * (img_size // patch_size)
         self.in_groups = in_groups
-        self.drop_channels=drop_channels
+        self.keep_channels=keep_channels
+        self.aggregate = True if aggregation=="pre" else False
+
+        self.debug=debug
+
         if reduce_group:
             self.proj = nn.ModuleList([nn.Conv2d(1, embed_dim//len(self.in_groups), \
                                         kernel_size=patch_size, stride=patch_size) \
@@ -201,8 +206,9 @@ class GroupedPatchEmbedSimple(nn.Module):
 
         x_ = x[:, gg]
 
-        if self.training and x_.shape[1]>1 and self.drop_channels:
-            keep_idxs = random.sample(range(x_.shape[1]), random.randint(1, x_.shape[1]))
+        if self.training and x_.shape[1]>1:
+
+            keep_idxs = random.sample(range(x_.shape[1]), random.choice(self.keep_channels))
             x_ = x[:, keep_idxs]
             gg = keep_idxs
 
@@ -213,11 +219,17 @@ class GroupedPatchEmbedSimple(nn.Module):
         x_ = self.proj[i](x_)
         x_ = rearrange(x_, 'b c (n h) w -> b c n h w', n=len(gg))
 
-        return x_.mean(2)
+        if self.aggregate:
+            return torch.mean(x_, dim=2, keepdim=True)
+
+        return x_
 
     def forward(self, x):
 
         B, C, H, W = x.shape
+
+        if self.debug:
+            print(f"input.shape: {x.shape}")
 
         x = [self.process_grp(x,i,gg) for i,gg in enumerate(self.in_groups)]
 
@@ -248,9 +260,17 @@ class StreamCombiner(nn.Module):
 
         self.norm = nn.LayerNorm(dim)
             
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, all_chans=None):
+
+        x1 = rearrange(x1, "(b c) ... -> b c ...", c=all_chans[0])
+        x2 = rearrange(x2, "(b c) ... -> b c ...", c=all_chans[1])
+
+        x1 = x1.mean(1)
+        x2 = x2.mean(1)
+
         x = torch.cat([x1, x2], dim=-1)
         x = self.norm(x)
+
         return x
     
 
@@ -260,18 +280,20 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=partial(nn.LayerNorm, eps=1e-6), return_all_tokens=False, 
-                 init_values=0, use_mean_pooling=False, masked_im_modeling=False, num_prefix_tokens=1, 
-                 
-                 pre_layers=None, post_layer_count=-1, drop_channels=True, patch_embed_layer='PE', **embed_kwargs):
+                 init_values=0, use_mean_pooling=False, masked_im_modeling=False, num_prefix_tokens=1,
+                 **cce_kwargs
+                 ):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.return_all_tokens = return_all_tokens
 
-        self.in_groups = [[0,1,2],[3]]
-        self.drop_channels = drop_channels
+        self.in_groups = cce_kwargs['in_groups']
+        self.keep_channels = cce_kwargs['keep_channels']
+        self.aggregation = cce_kwargs['aggregation']
 
         self.patch_embed = GroupedPatchEmbedSimple(
-                    img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim, in_groups=self.in_groups, drop_channels=drop_channels)
+                    img_size=img_size[0], patch_size=patch_size, embed_dim=embed_dim, 
+                    in_groups=self.in_groups, keep_channels=self.keep_channels, aggregation=self.aggregation)
 
         num_patches = self.patch_embed.num_patches
 
@@ -282,12 +304,12 @@ class VisionTransformer(nn.Module):
         self.pos_drop = nn.Dropout(p=drop_rate)
         self.num_prefix_tokens = num_prefix_tokens
 
-        pre_layers = [0,1,2,3] if pre_layers == None else pre_layers
+        pre_layers = list(range(4)) if cce_kwargs['n_pre_layers'] == None else list(range(cce_kwargs['n_pre_layers']))
 
-        if post_layer_count == -1:
+        if cce_kwargs['n_post_layers'] == -1:
             post_layers_all = self.solve_final_layers(len(pre_layers), small_dim, embed_dim)
         else:
-            post_layers_all = post_layer_count
+            post_layers_all = cce_kwargs['n_post_layers']
             
         post_layers = list(range(pre_layers[-1]+1, pre_layers[-1]+1+post_layers_all))
 
@@ -329,7 +351,6 @@ class VisionTransformer(nn.Module):
         self.masked_im_modeling = masked_im_modeling
         if masked_im_modeling:
             self.masked_embed = nn.Parameter(torch.zeros(1, embed_dim))
-            # self.masked_embed = nn.Parameter(torch.zeros(1, small_dim))
             self.keep_mask=True
         else:
             self.keep_mask=False
@@ -339,45 +360,14 @@ class VisionTransformer(nn.Module):
     def solve_final_layers(self, L_branch, D_branch=384, D_final=768):
 
         P_orig=12 * D_final**2 * 12
-        # Param per layer
         P_branch_layer = 2 * 12 * D_branch**2
         P_final_layer = 12 * D_final**2
 
-        # Total used by branches
-        P_branch = L_branch * P_branch_layer
-
-        # Remaining budget
-        P_remaining = P_orig - P_branch
-
-        # Solve for how many final layers we can fit
-        L_final = P_remaining // P_final_layer
+        P_branch = L_branch * P_branch_layer # Total used by branches
+        P_remaining = P_orig - P_branch # Remaining budget
+        L_final = P_remaining // P_final_layer # Solve for how many final layers we can fit
         return int(L_final)
 
-    
-    def solve_final_dim(self, L_branch, L_final, D_branch=384, d_normal=768):
-
-        P_orig=12 * d_normal**2 * 12
-        # Branch param count
-        candidate_dims = [384, 512, 576, 640, 768, 832, 896, 960, 1024, 1152, 1280, 1536]
-        
-        # Param budget used by branches
-        P_branch = 2 * L_branch * 12 * D_branch**2
-        
-        # Remaining budget for final stage
-        P_final_budget = P_orig - P_branch
-        
-        # Try all candidate dims, find closest match in total param budget
-        best_D = None
-        best_diff = float('inf')
-        for D in candidate_dims:
-            P_final = L_final * 12 * D**2
-            total_params = P_branch + P_final
-            diff = abs(P_orig - total_params)
-            if diff < best_diff:
-                best_diff = diff
-                best_D = D
-
-        return best_D
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -388,13 +378,16 @@ class VisionTransformer(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def interpolate_pos_encoding(self, x, w, h):
+    def interpolate_pos_encoding(self, x, w, h, c_idx):
+
+        pos_embed = self.pos_embed[:, :, c_idx*(self.embed_dim//2):(c_idx+1)*(self.embed_dim//2)]
+
         npatch = x.shape[1] - 1
-        N = self.pos_embed.shape[1] - self.num_prefix_tokens
+        N = pos_embed.shape[1] - self.num_prefix_tokens
         if npatch == N and w == h:
-            return self.pos_embed
-        class_pos_embed = self.pos_embed[:, 0:self.num_prefix_tokens]
-        patch_pos_embed = self.pos_embed[:, self.num_prefix_tokens:]
+            return pos_embed
+        class_pos_embed = pos_embed[:, 0:self.num_prefix_tokens]
+        patch_pos_embed = pos_embed[:, self.num_prefix_tokens:]
         dim = x.shape[-1]
         w0 = w // self.patch_embed.patch_size
         h0 = h // self.patch_embed.patch_size
@@ -414,43 +407,58 @@ class VisionTransformer(nn.Module):
         B, nc, w, h = x.shape
         # patch linear embedding
 
-        x = self.patch_embed(x)
+        x = self.patch_embed(x) # x = [x_context, x_stain]
+        
+        cnt_chans = x[0].shape[2]
+        stn_chans = x[1].shape[2]
 
-        x = torch.cat(x, dim=1)
+        all_chans = [cnt_chans, stn_chans]
 
-        if mask is not None:
-            x = self.mask_model(x, mask=mask)
+        x_new = []
 
-        x = x.flatten(2).transpose(1, 2)
+        for c_idx, xx in enumerate(x):
+            xx = rearrange(xx, "b d c h w -> (b c) d h w")
 
-        # add the [CLS] token to the embed patch tokens
-        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+            if mask is not None:
+                msk = mask.unsqueeze(1).expand(-1, all_chans[c_idx], -1, -1)
+                msk = rearrange(msk, "b c h w -> (b c) h w")
+                mask_embed = self.masked_embed[:, c_idx*(self.embed_dim//2):(c_idx+1)*(self.embed_dim//2)]
+                if self.keep_mask:
+                    xx.permute(0, 2, 3, 1)[msk, :] = mask_embed.to(xx.dtype)
+                else:
+                    xx.permute(0, 2, 3, 1)[msk, :] += 0.1*mask_embed.to(xx.dtype)
+                "masking done"
 
-        # add positional encoding to each token
-        x = x + self.interpolate_pos_encoding(x, w, h)
+            xx = xx.flatten(2).transpose(1, 2)
+            # add the [CLS] token to the embed patch tokens
+            cls_tokens = self.cls_token[:,:,c_idx*(self.embed_dim//2):(c_idx+1)*(self.embed_dim//2)].expand(xx.shape[0], -1, -1)
+            xx = torch.cat((cls_tokens, xx), dim=1)
+            # add positional encoding to each token
+            xx = xx + self.interpolate_pos_encoding(xx, w, h, c_idx)
+            xx = self.pos_drop(xx)
+            xx = rearrange(xx, "(b c) N d -> b c N d", c=all_chans[c_idx])
+            x_new.append(xx)
 
-        x = self.pos_drop(x)
-
-        x = tuple(torch.split(x, x.shape[-1]//2, dim=-1))
-
-        return x
+        return tuple(x_new), all_chans
 
     def forward(self, x, return_all_tokens=None, mask=None):
         # mim
         if self.masked_im_modeling:
             assert mask is not None
-            x = self.prepare_tokens(x, mask=mask)
+            x, all_chans = self.prepare_tokens(x, mask=mask)
         else:
-            x = self.prepare_tokens(x)
+            x, all_chans = self.prepare_tokens(x)
 
         x_cnt, x_stn = x
+
+        x_cnt = rearrange(x_cnt, "b c ... -> (b c) ...")
+        x_stn = rearrange(x_stn, "b c ... -> (b c) ...")
 
         for cnt_blk, stn_blk in zip(self.cnt_blocks, self.stn_blocks):
             x_cnt = cnt_blk(x_cnt)
             x_stn = stn_blk(x_stn)
 
-        x = self.combiner(x_stn, x_cnt)
+        x = self.combiner(x_cnt, x_stn, all_chans)
 
         for blk in self.cmb_blocks:
             x = blk(x)
@@ -525,14 +533,21 @@ def vit_large(patch_size=16, **kwargs):
 
 if __name__ == '__main__':
 
-    model = vit_small(masked_im_modeling=True, pre_layers=[0,1]).cuda()
+    cce_kwargs = {
+        "in_groups" : [[0,1,2], [3]],  #  context and concept group channel indexes
+        "n_pre_layers": 2,
+        "n_post_layers": -1,
+        "aggregation": "post", # "pre" for pre-aggregation
+    }
 
-    model.masked_im_modeling=True
+    "we randomly keep from rate distribution of [1,2,3] channels. For the teacher network during training, it is set to [3] (all channels)."
+    model = vit_small(masked_im_modeling=False, keep_channels=[1,2,3], **cce_kwargs).cuda()
+    print(model)
 
-    mask = torch.randint(0, 2, (8, 14, 14), dtype=torch.bool).cuda()
+    model.eval()
+
     img = torch.randn(8, 4, 224, 224).cuda()
-
-    model.train()
-    out = model(img, mask=mask)
+    out = model(img, return_all_tokens=False)
 
     print(out.shape)
+

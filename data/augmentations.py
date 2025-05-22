@@ -260,11 +260,10 @@ class DataAugmentationFinetune_HPA(object):
 
 class DataAugmentationiBOT_HPA_CVIT(object):
     def __init__(self, global_crops_scale, local_crops_scale, global_crops_number, local_crops_number, global_crops_size=224,
-                 local_crops_size=96,):
+                 local_crops_size=96, total_channels=4, channel_budget=2):
 
-        # TODO: WE CAN CHANGE THIS LATER
-        self.channel_budget = 2
-        self.total_channels = 4
+        self.channel_budget = channel_budget
+        self.total_channels = total_channels
 
         self.crop_flip =  v2.Compose([
             v2.RandomResizedCrop(

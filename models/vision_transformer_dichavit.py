@@ -233,13 +233,15 @@ import random
 class DiChaViTEmbed(nn.Module):
     """ Image to Patch Embedding with Shared Projections
     """
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, channel_budget=2):
         super().__init__()
 
         num_patches = (img_size // patch_size) * (img_size // patch_size)
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = num_patches
+
+        self.channel_budget = channel_budget
 
         self.proj = nn.Conv2d(1, embed_dim, kernel_size=patch_size, stride=patch_size)
 
@@ -283,7 +285,7 @@ class DiChaViTEmbed(nn.Module):
         if self.training and cur_channels==None:
 
             cur_channels = [0,1,2,3]
-            Cin_new = 2 # we dont have budget to run a random number of channels! 
+            Cin_new = self.channel_budget # we dont have budget to run a random number of channels! 
 
             # channel_embed = self.channel_embed(tensor(cur_channels, device=x.device))
 
@@ -389,7 +391,10 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=partial(nn.LayerNorm, eps=1e-6), return_all_tokens=False, 
-                 init_values=0, use_mean_pooling=False, masked_im_modeling=False, num_prefix_tokens=1, patch_embed_layer='PE', **embed_kwargs):
+                 init_values=0, use_mean_pooling=False, masked_im_modeling=False, num_prefix_tokens=1, 
+                 
+                 channel_budget=2
+                 ):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.return_all_tokens = return_all_tokens
@@ -397,7 +402,8 @@ class VisionTransformer(nn.Module):
 
 
         self.patch_embed = DiChaViTEmbed(
-                    img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+                    img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim, 
+                    channel_budget=channel_budget)
 
         num_patches = self.patch_embed.num_patches
 
