@@ -177,7 +177,9 @@ cython_debug/
 *.pt
 *.h5
 results/
+results*
 data/HPA_metadata.csv
+data/pretrain_images.csv
 
 
 out_3ch.txt

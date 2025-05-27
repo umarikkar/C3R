@@ -22,120 +22,17 @@ from scipy.optimize import linear_sum_assignment
 from scipy.stats import entropy
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 import timm
+import torch.nn as nn
+
+import cv2
 
 # Local Imports
-from data.hpa_dataset import HPASubCellDataset
+from data.hpa_dataset_single import HPASubCellDataset
 
-# Set up dataset
-dset = HPASubCellDataset(root='/scratch1/test_data/antibody_cell_imgs', n_cells=1, split='train')
-loader = DataLoader(dset, batch_size=1, num_workers=10, shuffle=True)
-
-
-images = []
-masks = []
-
-
-model = timm.create_model('vit_base_patch14_dinov2.lvd142m', pretrained=True)
-
-model = model.eval().cuda()
-
-data_config = timm.data.resolve_model_data_config(model)
-transforms = timm.data.create_transform(**data_config, is_training=False)
-
-with torch.no_grad():
-
-    outs = []
-
-    for idx, (imgss, maskss, labelss) in enumerate(tqdm(loader)):
-
-        img_all = imgss[0]
-        mask = maskss[0]
-
-        cell_imgs = img_all[0]  # shape: (4, 112, 112)
-
-        # cell_imgs = cell_imgs * (mask/255)
-
-        outs_img = []
-
-        for img in cell_imgs:
-
-            img = torch.stack([img for _ in range(3)]).cuda()
-            img = transforms(img)
-
-            out = model(img.unsqueeze(0)).cpu().detach()
-
-            outs_img.append(out)
-
-        outs.append(torch.stack(outs_img, dim=1))
-
-        if idx ==999:
-            break
-
-tensor = torch.stack(outs, dim=1)
-torch.save(tensor, 'dinov2_WTC11.pt')
-
-tensor_all = torch.load('dinov2_WTC11.pt')
-
-
-for immm, tensor in enumerate(tensor_all):
-
-    # ---------- INPUT ----------
-    # tensor shape: (N, C, D)
-    N, C, D = tensor.shape
-    tensor_np = tensor.numpy().reshape(-1, D)  # (N*C, D)
-
-    # True string labels per channel
-    class_names = ['Microtubules', 'Nucleus', 'ER', 'Protein']
-    true_labels = np.tile(class_names, N)       # (N*C,)
-
-    # ---------- UMAP ----------
-    reducer = umap.UMAP(n_components=2)
-    reduced = reducer.fit_transform(tensor_np)  # (N*C, 2)
-
-    # ---------- DATAFRAME ----------
-    df = pd.DataFrame({
-        'x': reduced[:, 0],
-        'y': reduced[:, 1],
-        'label': true_labels
-    })
-
-    # ---------- CUSTOM COLORS ----------
-    custom_palette = {
-        'Microtubules': 'tab:red',
-        'Nucleus': 'tab:blue',
-        'ER': 'tab:orange',
-        'Protein': 'tab:green'
-    }
-
-    # ---------- PLOT ----------
-    plt.figure(figsize=(5, 4))
-    plt.rcParams.update({'font.size': 11})
-    plt.grid(True, zorder=0)
-    ax = sns.scatterplot(
-        data=df,
-        x='x',
-        y='y',
-        hue='label',
-        palette=custom_palette,
-        s=5,
-        alpha=0.8,
-        edgecolor=None
-    )
-    for collection in ax.collections:
-        collection.set_zorder(3)
-    plt.locator_params(axis='x', nbins=5)
-    plt.locator_params(axis='y', nbins=4)
-    plt.xlabel("UMAP-1", fontsize=12)
-    plt.ylabel("UMAP-2", fontsize=12)
-    plt.legend(markerscale=2, fontsize=10)  # Increase markerscale for larger dots
-    sns.despine()
-    plt.tight_layout()
-    plt.savefig(f'umap_noMask_{immm}.pdf')
-    plt.close()
-
+import glob
 
 
 def parity_entropy_per_class(true_labels, cluster_preds, num_classes):
@@ -204,11 +101,160 @@ def compute_kmeans_labels(tensor, n_clusters):
 
     return true_labels, cluster_preds
 
+class MinMaxNormalize(nn.Module):
+    def __init__(self):
+        super().__init__()
 
-for tensor in tensor_all:
-    true_labels, cluster_preds = compute_kmeans_labels(tensor, n_clusters=4)
-    overall_parity, parity_per_class, entropy_per_class = parity_entropy_per_class(true_labels, cluster_preds, 4)
-    print("Parity per class:", parity_per_class)
-    print("Entropy per class:", entropy_per_class)
+    def forward(self, x):
+        min = torch.amin(x, dim=(1, 2), keepdim=True)
+        max = torch.amax(x, dim=(1, 2), keepdim=True)
+
+        x = (x - min) / (max - min + 1e-6)
+
+        return x
+
+class myDset(Dataset):
+
+    def __init__(self, img_list, dtype='uint8'):
+        super().__init__()
+
+        self.img_list = glob.glob('/scratch1/test_data/antibody_cell_imgs/train-pretrain_uint8/*/*.png')
+        self.dtype = dtype
+        self.normalize = MinMaxNormalize()
+
+    def __getitem__(self, index):
+
+        img = cv2.imread(self.img_list[index], -1)
+
+        if self.dtype == 'uint8' and img.dtype == np.uint16:
+            img = (img/255).astype(np.uint8)
+        elif self.dtype == 'uint16' and img.dtype == np.uint8:
+            img = (img*255).astype(np.uint16)
+
+        img = torch.tensor(img, dtype=torch.float32).permute(2,0,1)
+
+        # normalize
+        img = self.normalize(img)
+
+        return img, -1
+    
+    def __len__(self):
+
+        return len(self.img_list)
+    
+
+# # Set up dataset
+# dset = HPASubCellDataset(root='/scratch1/test_data/antibody_cell_imgs', split='train', uint8=False, normalize=True, transform=None)
+
+model = timm.create_model('vit_base_patch14_dinov2.lvd142m', pretrained=True)
+
+model = model.eval().cuda()
+
+data_config = timm.data.resolve_model_data_config(model)
+transforms = timm.data.create_transform(**data_config, is_training=False)
+
+pretrain_imgs = None
+
+fname = 'dinov2_hpav3_uint8'
+
+dset = myDset(pretrain_imgs, dtype=fname.split('_')[-1])
+loader = DataLoader(dset, batch_size=1, num_workers=0, shuffle=False)
+
+images = []
+masks = []
+
+
+with torch.no_grad():
+
+    outs = []
+
+    for idx, (imgss, labelss) in enumerate(tqdm(loader)):
+
+        cell_imgs = imgss[0]
+
+        # cell_imgs = cell_imgs * (mask/255)
+
+        outs_img = []
+
+        for img in cell_imgs:
+
+            img = torch.stack([img for _ in range(3)]).cuda()
+            img = transforms(img)
+
+            out = model(img.unsqueeze(0)).cpu().detach()
+
+            outs_img.append(out)
+
+        outs.append(torch.stack(outs_img, dim=1))
+
+        if idx ==999:
+            break
+
+tensor = torch.stack(outs, dim=1)
+torch.save(tensor, f'{fname}.pt')
+
+tensor_all = torch.load(f'{fname}.pt')
+
+tensor = tensor_all[0]
+
+N, C, D = tensor.shape
+tensor_np = tensor.numpy().reshape(-1, D)  # (N*C, D)
+
+# True string labels per channel
+class_names = ['Microtubules', 'Nucleus', 'ER', 'Protein']
+true_labels = np.tile(class_names, N)       # (N*C,)
+
+# ---------- UMAP ----------
+reducer = umap.UMAP(n_components=2)
+reduced = reducer.fit_transform(tensor_np)  # (N*C, 2)
+
+# ---------- DATAFRAME ----------
+df = pd.DataFrame({
+    'x': reduced[:, 0],
+    'y': reduced[:, 1],
+    'label': true_labels
+})
+
+# ---------- CUSTOM COLORS ----------
+custom_palette = {
+    'Microtubules': 'tab:red',
+    'Nucleus': 'tab:blue',
+    'ER': 'tab:orange',
+    'Protein': 'tab:green'
+}
+
+# ---------- PLOT ----------
+plt.figure(figsize=(5, 4))
+plt.rcParams.update({'font.size': 11})
+plt.grid(True, zorder=0)
+ax = sns.scatterplot(
+    data=df,
+    x='x',
+    y='y',
+    hue='label',
+    palette=custom_palette,
+    s=5,
+    alpha=0.8,
+    edgecolor=None
+)
+for collection in ax.collections:
+    collection.set_zorder(3)
+plt.locator_params(axis='x', nbins=5)
+plt.locator_params(axis='y', nbins=4)
+plt.xlabel("UMAP-1", fontsize=12)
+plt.ylabel("UMAP-2", fontsize=12)
+plt.legend(markerscale=2, fontsize=10)  # Increase markerscale for larger dots
+sns.despine()
+plt.tight_layout()
+plt.savefig(f'{fname}.pdf')
+plt.close()
+
+
+
+
+true_labels, cluster_preds = compute_kmeans_labels(tensor, n_clusters=4)
+overall_parity, parity_per_class, entropy_per_class = parity_entropy_per_class(true_labels, cluster_preds, 4)
+print("Parity per class:", parity_per_class)
+print("Entropy per class:", entropy_per_class)
 
 
