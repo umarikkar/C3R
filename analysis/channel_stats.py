@@ -30,7 +30,7 @@ import torch.nn as nn
 import cv2
 
 # Local Imports
-from data.hpa_dataset_single import HPASubCellDataset
+from data.hpa_dataset_basic import HPASubCellDataset
 
 import glob
 

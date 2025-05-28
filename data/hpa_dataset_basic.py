@@ -18,6 +18,8 @@ import einops
 import tifffile
 import json
 
+import cv2
+
 
 from torchvision.datasets import ImageFolder
 from torchvision.datasets.vision import VisionDataset
@@ -168,7 +170,7 @@ class HPASubCellDataset(VisionDataset):
 
         self.uint8 = uint8
         if self.uint8:
-            data_folder = os.path.join(root, f"{split}-pretrain_8bit")
+            data_folder = os.path.join(root, f"{split}-pretrain_uint8")
             self.file_paths = sorted(glob.glob(data_folder + '/*/*.png'))
         else:
             data_folder = os.path.join(root, f"{split}-pretrain")
@@ -203,7 +205,14 @@ class HPASubCellDataset(VisionDataset):
         filename = self.file_paths[idx]
 
         if self.uint8:
-            img = np.array(Image.open(filename))
+
+            """
+            this reads the channels in the order:
+            0. Microtubules, 1. ER, 2. Nuc,  3. Protein
+            """
+            img = cv2.imread(filename, -1)
+            # for i in range(4):
+            #     Image.fromarray(img[:,:,i]).save(f"{i}.png")
         else:
             img = tifffile.imread(filename)
 
