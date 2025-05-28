@@ -18,6 +18,8 @@ import einops
 import tifffile
 import json
 
+import cv2
+
 
 from torchvision.datasets import ImageFolder
 from torchvision.datasets.vision import VisionDataset
@@ -154,153 +156,86 @@ class HPASubCellDataset(VisionDataset):
             split: str,
             data_prop=1.,
 
-            color_channels=["red", "yellow", "blue", "green"],
-            n_cells: int = -1,
-            mask_prob: float = 0.0,
-            normalize: str = "min_max",
-            return_cell_mask: bool = False,
-            finetuning=False,
-
             transform: Optional[Callable] = None,
             target_transform: Optional[Callable] = None,
 
             channels='all',
+            uint8=True,
+            normalize=True,
 
-            
     ) -> None:
         super().__init__(root, transform=transform,
-                                            target_transform=target_transform)
+                                target_transform=target_transform)
         
-        data_folder = os.path.join(root, f"{split}-balanced")
-        
-        all_samples = pd.DataFrame({'filename':glob.glob(data_folder + '/*.h5'), 'antibody':''})
-        all_samples['antibody'] = [f.split('/')[-1][:-5] for f in all_samples['filename']]
-        with open(f"./data/annotations/splits/{split}_antibodies.txt") as file:
-            antibodies = pd.DataFrame({'antibody':[line.rstrip() for line in file]})
 
-        
-        self.finetuning = finetuning
-        # dropping the mitochondria channel
+        self.uint8 = uint8
+        if self.uint8:
+            data_folder = os.path.join(root, f"{split}-pretrain_uint8")
+            self.file_paths = sorted(glob.glob(data_folder + '/*/*.png'))
+        else:
+            data_folder = os.path.join(root, f"{split}-pretrain")
+            self.file_paths = sorted(glob.glob(data_folder + '/*/*.tiff'))
+
         self.channels = channels 
 
-        self.df = all_samples.merge(antibodies, on='antibody').reset_index()
         if data_prop < 1:
-            random_idxs = random.sample(list(range(len(self.df))), k=int(data_prop * len(self.df)))
-            self.df = self.df.iloc[random_idxs].reset_index()
+            random_idxs = random.sample(list(range(len(self.file_paths))), k=int(data_prop * len(self.file_paths)))
+            self.file_paths = [self.file_paths[ii] for ii in random_idxs]
 
-        print(f'created {split} dataset of {len(self.df)} samples.')
+        print(f'created {split} dataset of {len(self.file_paths)} samples.')
 
-        self.color_channels = color_channels
-        self.color_idxs = [i for i, c in enumerate(COLORS) if c in color_channels]
-        self.n_cells = n_cells
-
-        self.mask_prob = mask_prob
         self.epoch=0
 
-        self.normalize = MinMaxNormalize()
+        self.normalize = MinMaxNormalize() if normalize else None
 
         self.unique_cats = UNIQUE_CATS
         self.num_classes = NUM_CLASSES
 
-        self.return_cell_mask = return_cell_mask
         self.split=split
 
     def set_epoch(self, epoch):
         self.epoch = epoch
 
     def __len__(self):
-        return len(self.df)
-    
-    def get_mask_tensor(self, masks):
-        masks = (masks * 255).astype(np.uint8)
-        masks = grey_dilation(grey_dilation(masks, size=(1, 5, 1)), size=(1, 1, 5))
-        # masks = (masks / 255.0).astype(np.float32)
-        masks = (masks / 255.0).astype(np.float16)
-        masks = torch.from_numpy(masks[:, None, :, :])
-        return masks
+        return len(self.file_paths)
 
-    def get_random_mask(self, mask_tensor):
-        n_cells = mask_tensor.shape[0]
-        n_non_masked = int(n_cells * (1 - self.mask_prob))
-        mask_idxs = np.random.choice(n_cells, n_non_masked, replace=False)
-        mask_tensor[mask_idxs] = 1.0
-        return mask_tensor
-    
-    def get_select_idxs(self, cell_line, plate_postion, num_cells):
-        if self.n_cells > 0 and num_cells > self.n_cells:
-            df = pd.DataFrame(
-                {
-                    "cell_line": cell_line.split(";"),
-                    "plate_position": plate_postion.split(";"),
-                }
-            )
-            select_idxs = get_stratified_idxs(df, self.n_cells)
-        elif self.n_cells > 0:
-            # TODO: handle this such that we send the initial number + some randomly assigned n_cells. 
-            select_idxs = np.arange(num_cells)
-        else:
-            select_idxs = np.arange(num_cells)
-        return select_idxs
-
-    def get_img_and_transform(self, img):
-
-        # return torch.tensor(img).permute(2,0,1)
-
-        img = torch.tensor(img, dtype=torch.float32).permute(2,0,1)
-
-        # normalize
-        img = self.normalize(img)
-
-        # get the crops: will return a duo of images for each cell!
-        if self.transform is not None:
-            img = self.transform(img)
-
-        return img
-    
 
     def __getitem__(self, idx: int) -> Tuple:
 
-        with h5py.File(self.df['filename'][idx], "r") as f:
-            select_idxs = self.get_select_idxs(f.attrs["cell_line"], f.attrs["plate_position"], f.attrs["num_cells"])
-            antibody_id = f.attrs["antibody"]
+        filename = self.file_paths[idx]
+
+        if self.uint8:
 
             """
-            when using 448px, load with the mask. 
-            Otherwise load wihtout the mask as it is already saved without!
+            this reads the channels in the order:
+            0. Microtubules, 1. ER, 2. Nuc,  3. Protein
             """
-            valid_or_missing = self.split == 'valid' or 'imgs_256' not in self.df['filename'][idx]
-
-            if self.channels == 'mt':
-                slice_range = slice(1, -1 if valid_or_missing else None)
-            elif self.channels == 'all':
-                slice_range = slice(None, -1 if valid_or_missing else None)
-            elif self.channels == 'random':
-                r = torch.randint(0, 4, [])
-                slice_range = slice(r, r + 1)
-            
-            images = [self.get_img_and_transform(f[f"img_{i}"][:, :, slice_range]) for i in select_idxs]
-
-            if self.finetuning:
-                target = np.array(f['target'])
-
-        antibody_id_tensor = torch.tensor(
-            [int(re.findall(r"\d+", antibody_id)[0])] * len(images)
-        )
-
-        if self.finetuning:
-            target = torch.tensor(target)
-            return torch.stack(images), torch.stack([target for _ in range(len(images))]).float()
-        
-        #  this is for pre-training only
-        if self.transform is not None:
-            flattened_images = [tensor for group in images for tensor in group]
-            return flattened_images, antibody_id_tensor
-        
+            img = cv2.imread(filename, -1)
+            # for i in range(4):
+            #     Image.fromarray(img[:,:,i]).save(f"{i}.png")
         else:
-            return torch.stack(images), antibody_id
+            img = tifffile.imread(filename)
+
+        if self.channels == 'all':
+            slice_range = slice(None, None)
+        elif self.channels == 'mt':
+            slice_range = slice(1, None)
+        elif self.channels == 'random':
+            r = torch.randint(0, 4, [])
+            slice_range = slice(r, r + 1)
+
+        img = img[:, :, slice_range]
+
+        if self.normalize is not None:
+            img = torch.tensor(img, dtype=torch.float32).permute(2,0,1)
+            img = self.normalize(img)
+            if self.transform is not None:
+                img = self.transform(img)
+
+        return img, -1
 
 
-class HPASubCellDataset_saver(VisionDataset):
+class HPASubCellDataset_bit_converter(VisionDataset):
 
     def __init__(
             self,
@@ -308,48 +243,27 @@ class HPASubCellDataset_saver(VisionDataset):
             split: str,
             data_prop=1.,
 
-            color_channels=["red", "yellow", "blue", "green"],
-            n_cells: int = -1,
-            mask_prob: float = 0.0,
-            normalize: str = "min_max",
-            return_cell_mask: bool = False,
-            finetuning=False,
-
             transform: Optional[Callable] = None,
             target_transform: Optional[Callable] = None,
 
             channels='all',
 
-            
     ) -> None:
         super().__init__(root, transform=transform,
-                                            target_transform=target_transform)
+                                target_transform=target_transform)
         
-        data_folder = os.path.join(root, f"{split}-balanced")
-        self.save_folder = os.path.join(root, f"{split}-pretrain")
+        data_folder = os.path.join(root, f"{split}-pretrain")
         
-        all_samples = pd.DataFrame({'filename':glob.glob(data_folder + '/*.h5'), 'antibody':''})
-        all_samples['antibody'] = [f.split('/')[-1][:-5] for f in all_samples['filename']]
-        with open(f"./data/annotations/splits/{split}_antibodies.txt") as file:
-            antibodies = pd.DataFrame({'antibody':[line.rstrip() for line in file]})
+        self.file_paths = sorted(glob.glob(data_folder + '/*/*.tiff'))
 
-        
-        self.finetuning = finetuning
-        # dropping the mitochondria channel
         self.channels = channels 
 
-        self.df = all_samples.merge(antibodies, on='antibody').reset_index()
         if data_prop < 1:
-            random_idxs = random.sample(list(range(len(self.df))), k=int(data_prop * len(self.df)))
-            self.df = self.df.iloc[random_idxs].reset_index()
+            random_idxs = random.sample(list(range(len(self.file_paths))), k=int(data_prop * len(self.file_paths)))
+            self.file_paths = [self.file_paths[ii] for ii in random_idxs]
 
-        print(f'created {split} dataset of {len(self.df)} samples.')
+        print(f'created {split} dataset of {len(self.file_paths)} samples.')
 
-        self.color_channels = color_channels
-        self.color_idxs = [i for i, c in enumerate(COLORS) if c in color_channels]
-        self.n_cells = n_cells
-
-        self.mask_prob = mask_prob
         self.epoch=0
 
         self.normalize = MinMaxNormalize()
@@ -357,93 +271,31 @@ class HPASubCellDataset_saver(VisionDataset):
         self.unique_cats = UNIQUE_CATS
         self.num_classes = NUM_CLASSES
 
-        self.return_cell_mask = return_cell_mask
         self.split=split
 
     def set_epoch(self, epoch):
         self.epoch = epoch
 
     def __len__(self):
-        return len(self.df)
-    
-    def get_mask_tensor(self, masks):
-        masks = (masks * 255).astype(np.uint8)
-        masks = grey_dilation(grey_dilation(masks, size=(1, 5, 1)), size=(1, 1, 5))
-        # masks = (masks / 255.0).astype(np.float32)
-        masks = (masks / 255.0).astype(np.float16)
-        masks = torch.from_numpy(masks[:, None, :, :])
-        return masks
+        return len(self.file_paths)
 
-    def get_random_mask(self, mask_tensor):
-        n_cells = mask_tensor.shape[0]
-        n_non_masked = int(n_cells * (1 - self.mask_prob))
-        mask_idxs = np.random.choice(n_cells, n_non_masked, replace=False)
-        mask_tensor[mask_idxs] = 1.0
-        return mask_tensor
-    
-    def get_select_idxs(self, cell_line, plate_postion, num_cells):
-        if self.n_cells > 0 and num_cells > self.n_cells:
-            df = pd.DataFrame(
-                {
-                    "cell_line": cell_line.split(";"),
-                    "plate_position": plate_postion.split(";"),
-                }
-            )
-            select_idxs = get_stratified_idxs(df, self.n_cells)
-        elif self.n_cells > 0:
-            # TODO: handle this such that we send the initial number + some randomly assigned n_cells. 
-            select_idxs = np.arange(num_cells)
-        else:
-            select_idxs = np.arange(num_cells)
-        return select_idxs
-
-    def get_img_and_transform(self, img):
-
-        # return torch.tensor(img).permute(2,0,1)
-
-        img = torch.tensor(img, dtype=torch.float32).permute(2,0,1)
-
-        # normalize
-        img = self.normalize(img)
-
-        # get the crops: will return a duo of images for each cell!
-        if self.transform is not None:
-            img = self.transform(img)
-
-        return img
-    
 
     def __getitem__(self, idx: int) -> Tuple:
-        
-        h5_path = self.df['filename'][idx]
 
-        with h5py.File(h5_path, "r") as f:
+        filename = self.file_paths[idx]
 
-            antibody = f.attrs['antibody']
-            plate_positions = f.attrs['plate_position'].split(';')
-            cell_lines = f.attrs['cell_line'].split(';')
-            num_cells = int(f.attrs['num_cells'])
+        out_path = filename.replace("pretrain", "pretrain_8bit").replace(".tiff", ".png")
 
-            output_dir = os.path.join(self.save_folder, antibody)
-            os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-            for i in range(num_cells):
-                img = f[f"img_{i}"][:,:,:-1]  # shape (448, 448, 5), uint16
-                target = f[f"target_{i}"][:]  # shape (35,), uint8
-                plate_position = plate_positions[i]
-                cell_line = cell_lines[i]
+        img = tifffile.imread(filename)
 
-                metadata = {
-                    "antibody": antibody,
-                    "plate_position": plate_position,
-                    "cell_line": cell_line
-                }
-                out_path = os.path.join(output_dir, f"{plate_position}_{i}_{idx}.tiff")
-                tifffile.imwrite(out_path, img, dtype=np.uint16, description=json.dumps(metadata))
+        img =  (img / 256).astype(np.uint8)
 
-        os.remove(h5_path)
+        Image.fromarray(img, mode="RGBA").save(out_path)
 
         return 0
+
 
 
 class GaussianBlur(object):
